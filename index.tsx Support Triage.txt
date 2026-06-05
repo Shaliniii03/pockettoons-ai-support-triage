@@ -1,0 +1,1268 @@
+import { createFileRoute } from "@tanstack/react-router";
+import { useMemo, useRef, useState } from "react";
+import { useServerFn } from "@tanstack/react-start";
+import { toast } from "sonner";
+import {
+  Upload,
+  Sparkles,
+  Download,
+  AlertTriangle,
+  CheckCircle2,
+  FileText,
+  Loader2,
+  TicketIcon,
+  ShieldAlert,
+  Gauge,
+  BookOpen,
+  Search,
+  ArrowUpDown,
+  ArrowUp,
+  ArrowDown,
+  CreditCard,
+  UserCog,
+  Inbox,
+  ChevronDown,
+  Play,
+  MessageSquare,
+  Bell,
+  Wrench,
+  X,
+} from "lucide-react";
+
+import { Button } from "@/components/ui/button";
+import { Card } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import {
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
+} from "@/components/ui/table";
+import {
+  Collapsible,
+  CollapsibleContent,
+  CollapsibleTrigger,
+} from "@/components/ui/collapsible";
+import { Toaster } from "@/components/ui/sonner";
+import { Progress } from "@/components/ui/progress";
+import { cn } from "@/lib/utils";
+
+import { triageTickets, generateSyntheticTickets } from "@/lib/triage.functions";
+import { parseCsv, toCsv, download, type TicketRow } from "@/lib/csv";
+
+type Result = {
+  ticket_id: string;
+  category: string;
+  confidence: number;
+  suggested_reply: string;
+  escalation_required: boolean;
+  escalation_reason: string;
+};
+
+type Merged = Result & { ticket_text: string };
+
+const CATEGORIES = [
+  "Billing & Payments",
+  "Account Issues",
+  "Content Access Problems",
+  "Technical Bugs",
+  "General Feedback",
+];
+
+type SortKey =
+  | "ticket_id"
+  | "category"
+  | "confidence"
+  | "escalation_required";
+
+export const Route = createFileRoute("/")({
+  head: () => ({
+    meta: [
+      { title: "AI Support Triage — PocketToons" },
+      {
+        name: "description",
+        content:
+          "AI-powered customer support ticket triage: classify tickets, suggest replies, and flag escalations.",
+      },
+      { property: "og:title", content: "AI Support Triage" },
+      {
+        property: "og:description",
+        content:
+          "Classify support tickets, generate empathetic replies, and surface escalations automatically.",
+      },
+    ],
+  }),
+  component: Index,
+});
+
+function Index() {
+  const triage = useServerFn(triageTickets);
+  const synth = useServerFn(generateSyntheticTickets);
+
+  const [tickets, setTickets] = useState<TicketRow[]>([]);
+  const [results, setResults] = useState<Result[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadingSynth, setLoadingSynth] = useState(false);
+  const fileRef = useRef<HTMLInputElement>(null);
+
+  // table controls
+  const [query, setQuery] = useState("");
+  const [categoryFilter, setCategoryFilter] = useState<string>("all");
+  const [escFilter, setEscFilter] = useState<string>("all");
+  const [sortKey, setSortKey] = useState<SortKey>("ticket_id");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
+  const [activeFilterCard, setActiveFilterCard] = useState<string | null>(null);
+
+  async function handleUpload(file: File) {
+    try {
+      const text = await file.text();
+      const rows = parseCsv(text);
+      if (rows.length === 0) {
+        toast.error("No valid tickets found in CSV.");
+        return;
+      }
+      if (rows.length > 100) {
+        toast.error("Please upload at most 100 tickets at a time.");
+        return;
+      }
+      setTickets(rows);
+      setResults([]);
+      toast.success(`Loaded ${rows.length} tickets.`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to parse CSV.");
+    }
+  }
+
+  async function loadSynthetic() {
+    setLoadingSynth(true);
+    try {
+      const { tickets: t } = await synth({ data: { count: 20 } });
+      setTickets(t);
+      setResults([]);
+      toast.success(`Generated ${t.length} synthetic tickets.`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Generation failed.");
+    } finally {
+      setLoadingSynth(false);
+    }
+  }
+
+  async function runTriage() {
+    if (tickets.length === 0) {
+      toast.error("Upload a CSV or generate synthetic tickets first.");
+      return;
+    }
+    setLoading(true);
+    try {
+      const r = await triage({ data: { tickets } });
+      setResults(r);
+      toast.success(`Triaged ${r.length} tickets.`);
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Triage failed.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  const merged: Merged[] = useMemo(() => {
+    if (results.length === 0) return [];
+    const byId = new Map(tickets.map((t) => [t.ticket_id, t.ticket_text]));
+    return results.map((r) => ({
+      ...r,
+      ticket_text: byId.get(r.ticket_id) ?? "",
+    }));
+  }, [results, tickets]);
+
+  const analytics = useMemo(() => {
+    if (results.length === 0) return null;
+    const counts: Record<string, number> = {};
+    for (const c of CATEGORIES) counts[c] = 0;
+    for (const r of results) counts[r.category] = (counts[r.category] ?? 0) + 1;
+    const sorted = Object.entries(counts).sort((a, b) => b[1] - a[1]);
+    const top2 = sorted.slice(0, 2).filter(([, n]) => n > 0);
+    const escalated = results.filter((r) => r.escalation_required).length;
+    const avgConf = results.reduce((s, r) => s + r.confidence, 0) / results.length;
+    return {
+      total: results.length,
+      counts,
+      top2,
+      escalated,
+      escalationRate: (escalated / results.length) * 100,
+      avgConf,
+    };
+  }, [results]);
+
+  const filtered = useMemo(() => {
+    const q = query.trim().toLowerCase();
+    const rows = merged.filter((r) => {
+      if (categoryFilter !== "all" && r.category !== categoryFilter) return false;
+      if (escFilter === "escalated" && !r.escalation_required) return false;
+      if (escFilter === "normal" && r.escalation_required) return false;
+      if (!q) return true;
+      return (
+        r.ticket_id.toLowerCase().includes(q) ||
+        r.ticket_text.toLowerCase().includes(q) ||
+        r.suggested_reply.toLowerCase().includes(q) ||
+        r.category.toLowerCase().includes(q) ||
+        r.escalation_reason.toLowerCase().includes(q)
+      );
+    });
+    const sorted = [...rows].sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      let cmp = 0;
+      if (typeof av === "number" && typeof bv === "number") cmp = av - bv;
+      else if (typeof av === "boolean" && typeof bv === "boolean")
+        cmp = Number(av) - Number(bv);
+      else cmp = String(av).localeCompare(String(bv));
+      return sortDir === "asc" ? cmp : -cmp;
+    });
+    return sorted;
+  }, [merged, query, categoryFilter, escFilter, sortKey, sortDir]);
+
+  const escalatedTickets = useMemo(
+    () => merged.filter((r) => r.escalation_required),
+    [merged],
+  );
+
+  function toggleSort(k: SortKey) {
+    if (sortKey === k) setSortDir(sortDir === "asc" ? "desc" : "asc");
+    else {
+      setSortKey(k);
+      setSortDir("asc");
+    }
+  }
+
+  function exportCsv() {
+    const rows = merged.map((r) => ({
+      ticket_id: r.ticket_id,
+      original_ticket: r.ticket_text,
+      category: r.category,
+      confidence: r.confidence,
+      suggested_reply: r.suggested_reply,
+      escalation_required: r.escalation_required ? "Yes" : "No",
+      escalation_reason: r.escalation_reason,
+    }));
+    download("triage-results.csv", toCsv(rows), "text/csv");
+  }
+
+  function exportJson() {
+    download("triage-results.json", JSON.stringify(merged, null, 2), "application/json");
+  }
+
+  const hasResults = merged.length > 0;
+
+  return (
+    <div className="min-h-screen bg-muted/30">
+      <Toaster richColors position="top-right" />
+
+      <header className="border-b bg-card">
+        <div className="mx-auto flex max-w-7xl items-center justify-between px-6 py-4">
+          <div className="flex items-center gap-3">
+            <div className="flex h-9 w-9 items-center justify-center rounded-lg bg-primary text-primary-foreground">
+              <Sparkles className="h-4 w-4" />
+            </div>
+            <div>
+              <h1 className="text-base font-semibold tracking-tight">
+                AI Support Triage
+              </h1>
+              <p className="text-xs text-muted-foreground">
+                Upload tickets → AI classifies them → review escalations
+              </p>
+            </div>
+          </div>
+          <div className="flex items-center gap-2">
+            {tickets.length > 0 && (
+              <Badge variant="secondary" className="hidden sm:inline-flex">
+                <FileText className="mr-1 h-3 w-3" />
+                {tickets.length} loaded
+                {hasResults ? ` · ${results.length} triaged` : ""}
+              </Badge>
+            )}
+          </div>
+        </div>
+      </header>
+
+      <main className="mx-auto max-w-7xl space-y-6 px-6 py-6">
+        {/* Action bar */}
+        <Card className="p-4">
+          <div className="flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+            <div className="flex flex-wrap items-center gap-2">
+              <input
+                ref={fileRef}
+                type="file"
+                accept=".csv,text/csv"
+                className="hidden"
+                onChange={(e) => {
+                  const f = e.target.files?.[0];
+                  if (f) handleUpload(f);
+                  e.target.value = "";
+                }}
+              />
+              <Button variant="outline" size="sm" onClick={() => fileRef.current?.click()}>
+                <Upload className="mr-2 h-4 w-4" />
+                Upload CSV
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={loadSynthetic}
+                disabled={loadingSynth}
+              >
+                {loadingSynth ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Sparkles className="mr-2 h-4 w-4" />
+                )}
+                Generate synthetic
+              </Button>
+              <div className="mx-1 hidden h-6 w-px bg-border md:block" />
+              <Button
+                size="sm"
+                onClick={runTriage}
+                disabled={loading || tickets.length === 0}
+              >
+                {loading ? (
+                  <Loader2 className="mr-2 h-4 w-4 animate-spin" />
+                ) : (
+                  <Play className="mr-2 h-4 w-4" />
+                )}
+                Run AI triage
+              </Button>
+            </div>
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={exportCsv}
+                disabled={!hasResults}
+              >
+                <Download className="mr-2 h-4 w-4" />
+                CSV
+              </Button>
+              <Button
+                variant="outline"
+                size="sm"
+                onClick={exportJson}
+                disabled={!hasResults}
+              >
+                <Download className="mr-2 h-4 w-4" />
+                JSON
+              </Button>
+            </div>
+          </div>
+          <p className="mt-3 text-xs text-muted-foreground">
+            CSV columns required: <code className="rounded bg-muted px-1">ticket_id</code>,{" "}
+            <code className="rounded bg-muted px-1">ticket_text</code>. Max 100 tickets per batch.
+          </p>
+        </Card>
+
+        {/* Dashboard */}
+        {analytics ? (
+          <section className="grid grid-cols-2 gap-3 md:grid-cols-3 lg:grid-cols-5">
+            <StatCard
+              icon={<TicketIcon className="h-4 w-4" />}
+              label="Total processed"
+              value={analytics.total.toString()}
+              isActive={activeFilterCard === "total"}
+              onClick={() => {
+                setCategoryFilter("all");
+                setEscFilter("all");
+                setActiveFilterCard("total");
+              }}
+            />
+            <StatCard
+              icon={<CreditCard className="h-4 w-4" />}
+              label="Billing & Payments"
+              value={(analytics.counts["Billing & Payments"] ?? 0).toString()}
+              isActive={activeFilterCard === "Billing & Payments"}
+              onClick={() => {
+                setCategoryFilter("Billing & Payments");
+                setEscFilter("all");
+                setActiveFilterCard("Billing & Payments");
+              }}
+            />
+            <StatCard
+              icon={<UserCog className="h-4 w-4" />}
+              label="Account Issues"
+              value={(analytics.counts["Account Issues"] ?? 0).toString()}
+              isActive={activeFilterCard === "Account Issues"}
+              onClick={() => {
+                setCategoryFilter("Account Issues");
+                setEscFilter("all");
+                setActiveFilterCard("Account Issues");
+              }}
+            />
+            <StatCard
+              icon={<BookOpen className="h-4 w-4" />}
+              label="Content Access"
+              value={(analytics.counts["Content Access Problems"] ?? 0).toString()}
+              isActive={activeFilterCard === "Content Access Problems"}
+              onClick={() => {
+                setCategoryFilter("Content Access Problems");
+                setEscFilter("all");
+                setActiveFilterCard("Content Access Problems");
+              }}
+            />
+            <StatCard
+              icon={<Wrench className="h-4 w-4" />}
+              label="Technical Bugs"
+              value={(analytics.counts["Technical Bugs"] ?? 0).toString()}
+              isActive={activeFilterCard === "Technical Bugs"}
+              onClick={() => {
+                setCategoryFilter("Technical Bugs");
+                setEscFilter("all");
+                setActiveFilterCard("Technical Bugs");
+              }}
+            />
+            <StatCard
+              icon={<MessageSquare className="h-4 w-4" />}
+              label="General Feedback"
+              value={(analytics.counts["General Feedback"] ?? 0).toString()}
+              isActive={activeFilterCard === "General Feedback"}
+              onClick={() => {
+                setCategoryFilter("General Feedback");
+                setEscFilter("all");
+                setActiveFilterCard("General Feedback");
+              }}
+            />
+            <StatCard
+              icon={<ShieldAlert className="h-4 w-4" />}
+              label="Escalated"
+              value={analytics.escalated.toString()}
+              tone={analytics.escalated > 0 ? "warn" : "default"}
+              isActive={activeFilterCard === "escalated"}
+              onClick={() => {
+                setCategoryFilter("all");
+                setEscFilter("escalated");
+                setActiveFilterCard("escalated");
+              }}
+            />
+            <StatCard
+              icon={<AlertTriangle className="h-4 w-4" />}
+              label="Escalation rate"
+              value={`${analytics.escalationRate.toFixed(0)}%`}
+              tone={analytics.escalationRate >= 30 ? "warn" : "default"}
+            />
+            <StatCard
+              icon={<Gauge className="h-4 w-4" />}
+              label="Avg confidence"
+              value={`${analytics.avgConf.toFixed(1)}%`}
+            />
+          </section>
+        ) : null}
+
+        {/* Top 2 categories */}
+        {analytics && analytics.top2.length > 0 && (
+          <section className="grid gap-4 md:grid-cols-2">
+            {analytics.top2.map(([cat, n], i) => (
+              <Card key={cat} className="p-4">
+                <div className="flex items-center justify-between">
+                  <div className="flex items-center gap-2">
+                    <Badge variant="secondary">#{i + 1}</Badge>
+                    <p className="text-sm font-semibold">{cat}</p>
+                  </div>
+                  <Badge variant="outline">{n} tickets</Badge>
+                </div>
+                <details className="mt-3 text-xs text-muted-foreground">
+                  <summary className="cursor-pointer text-foreground hover:underline">
+                    Suggested reusable response template
+                  </summary>
+                  <pre className="mt-2 whitespace-pre-wrap rounded-md border bg-muted/30 p-3 font-sans text-xs leading-relaxed">
+                    {TEMPLATES[cat] ?? "Hi {{name}}, thanks for reaching out…"}
+                  </pre>
+                </details>
+              </Card>
+            ))}
+          </section>
+        )}
+
+        {/* Results — the hero section */}
+        <section>
+          <Card className="overflow-hidden p-0">
+            <div className="flex flex-col gap-3 border-b p-4 md:flex-row md:items-center md:justify-between">
+              <div>
+                <h2 className="text-sm font-semibold">Triage results</h2>
+                <p className="text-xs text-muted-foreground">
+                  {hasResults
+                    ? `${filtered.length} of ${merged.length} tickets shown`
+                    : "Run AI triage to populate results"}
+                </p>
+              </div>
+              {hasResults && (
+                <div className="flex flex-wrap items-center gap-2">
+                  <div className="relative">
+                    <Search className="absolute left-2 top-1/2 h-3.5 w-3.5 -translate-y-1/2 text-muted-foreground" />
+                    <Input
+                      value={query}
+                      onChange={(e) => setQuery(e.target.value)}
+                      placeholder="Search tickets…"
+                      className="h-9 w-48 pl-7"
+                    />
+                  </div>
+                  <Select value={categoryFilter} onValueChange={(v) => { setCategoryFilter(v); setActiveFilterCard(v === "all" ? null : v); }}>
+                    <SelectTrigger className="h-9 w-48">
+                      <SelectValue placeholder="Category" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All categories</SelectItem>
+                      {CATEGORIES.map((c) => (
+                        <SelectItem key={c} value={c}>
+                          {c}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                  <Select value={escFilter} onValueChange={(v) => { setEscFilter(v); setActiveFilterCard(v === "escalated" ? "escalated" : null); }}>
+                    <SelectTrigger className="h-9 w-40">
+                      <SelectValue placeholder="Escalation" />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All tickets</SelectItem>
+                      <SelectItem value="escalated">Escalated only</SelectItem>
+                      <SelectItem value="normal">Not escalated</SelectItem>
+                    </SelectContent>
+                  </Select>
+                  {(categoryFilter !== "all" || escFilter !== "all" || query) && (
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={() => {
+                        setCategoryFilter("all");
+                        setEscFilter("all");
+                        setQuery("");
+                        setActiveFilterCard(null);
+                      }}
+                    >
+                      <X className="mr-1 h-3.5 w-3.5" />
+                      Clear filters
+                    </Button>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {loading ? (
+              <LoadingState count={tickets.length || 6} />
+            ) : !hasResults ? (
+              <EmptyState hasTickets={tickets.length > 0} />
+            ) : (
+              <div className="overflow-x-auto">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <SortableHead
+                        label="Ticket ID"
+                        sortKey="ticket_id"
+                        current={sortKey}
+                        dir={sortDir}
+                        onClick={toggleSort}
+                        className="w-24"
+                      />
+                      <TableHead className="min-w-[240px]">Original ticket</TableHead>
+                      <SortableHead
+                        label="Category"
+                        sortKey="category"
+                        current={sortKey}
+                        dir={sortDir}
+                        onClick={toggleSort}
+                      />
+                      <SortableHead
+                        label="Confidence"
+                        sortKey="confidence"
+                        current={sortKey}
+                        dir={sortDir}
+                        onClick={toggleSort}
+                        className="w-32"
+                      />
+                      <TableHead className="min-w-[280px]">Suggested reply</TableHead>
+                      <SortableHead
+                        label="Escalate"
+                        sortKey="escalation_required"
+                        current={sortKey}
+                        dir={sortDir}
+                        onClick={toggleSort}
+                        className="w-24"
+                      />
+                      <TableHead className="min-w-[160px]">Escalation reason</TableHead>
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {filtered.map((r) => (
+                      <TableRow
+                        key={r.ticket_id}
+                        className={cn(
+                          r.escalation_required &&
+                            "bg-destructive/5 hover:bg-destructive/10",
+                        )}
+                      >
+                        <TableCell className="align-top font-mono text-xs">
+                          {r.ticket_id}
+                        </TableCell>
+                        <TableCell className="align-top text-sm">
+                          <p className="whitespace-pre-wrap">{r.ticket_text}</p>
+                        </TableCell>
+                        <TableCell className="align-top">
+                          <Badge variant="outline" className="whitespace-nowrap">
+                            {r.category}
+                          </Badge>
+                        </TableCell>
+                        <TableCell className="align-top">
+                          <ConfidenceMeter score={r.confidence} />
+                        </TableCell>
+                        <TableCell className="align-top whitespace-pre-wrap text-sm">
+                          {r.suggested_reply}
+                        </TableCell>
+                        <TableCell className="align-top">
+                          {r.escalation_required ? (
+                            <Badge
+                              variant="destructive"
+                              className="inline-flex items-center gap-1"
+                            >
+                              <AlertTriangle className="h-3 w-3" />
+                              Yes
+                            </Badge>
+                          ) : (
+                            <Badge
+                              variant="secondary"
+                              className="inline-flex items-center gap-1"
+                            >
+                              <CheckCircle2 className="h-3 w-3" />
+                              No
+                            </Badge>
+                          )}
+                        </TableCell>
+                        <TableCell className="align-top text-xs text-muted-foreground">
+                          {r.escalation_reason || "—"}
+                        </TableCell>
+                      </TableRow>
+                    ))}
+                    {filtered.length === 0 && (
+                      <TableRow>
+                        <TableCell
+                          colSpan={7}
+                          className="py-10 text-center text-sm text-muted-foreground"
+                        >
+                          No tickets match the current filters.
+                        </TableCell>
+                      </TableRow>
+                    )}
+                  </TableBody>
+                </Table>
+              </div>
+            )}
+          </Card>
+
+          {/* Category distribution mini-bar — only post-results */}
+          {analytics && (
+            <Card className="mt-4 p-4">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-muted-foreground">
+                Tickets per category
+              </h3>
+              <div className="mt-3 grid gap-3 md:grid-cols-2">
+                {CATEGORIES.map((c) => {
+                  const n = analytics.counts[c] ?? 0;
+                  const pct = (n / analytics.total) * 100;
+                  return (
+                    <div key={c}>
+                      <div className="flex justify-between text-xs">
+                        <span>{c}</span>
+                        <span className="text-muted-foreground">{n}</span>
+                      </div>
+                      <Progress value={pct} className="mt-1 h-1.5" />
+                    </div>
+                  );
+                })}
+              </div>
+            </Card>
+          )}
+        </section>
+
+        {/* Human Review Queue */}
+        {escalatedTickets.length > 0 && (
+          <section>
+            <div className="mb-1 flex items-center gap-2">
+              <Bell className="h-4 w-4 text-destructive" />
+              <h2 className="text-sm font-semibold">Human Review Queue</h2>
+              <Badge variant="destructive" className="h-5 px-1.5 text-[10px]">
+                {escalatedTickets.length} escalated
+              </Badge>
+            </div>
+            <p className="mb-3 text-xs text-muted-foreground">
+              These tickets require manual review due to business risk or low-confidence
+              classification.
+            </p>
+            <div className="grid gap-4 md:grid-cols-2">
+              {escalatedTickets.map((ticket) => (
+                <EscalationCard key={ticket.ticket_id} ticket={ticket} />
+              ))}
+            </div>
+          </section>
+        )}
+
+        {/* Write-up — collapsed by default */}
+        <CollapsibleWriteUp top2={analytics?.top2.map(([c]) => c) ?? []} />
+      </main>
+    </div>
+  );
+}
+
+function EscalationCard({ ticket }: { ticket: Merged }) {
+  return (
+    <Card className="overflow-hidden border-destructive/20">
+      <div className="flex flex-col gap-4 p-4 md:flex-row">
+        {/* Ticket info */}
+        <div className="flex-1 space-y-3">
+          <div className="flex flex-wrap items-center gap-2">
+            <span className="font-mono text-xs font-semibold text-foreground">
+              {ticket.ticket_id}
+            </span>
+            <Badge variant="outline" className="whitespace-nowrap">
+              {ticket.category}
+            </Badge>
+            <ConfidenceMeter score={ticket.confidence} />
+          </div>
+          <div>
+            <p className="text-[10px] font-medium uppercase tracking-wide text-muted-foreground">
+              Original ticket
+            </p>
+            <p className="mt-1 text-sm text-foreground">{ticket.ticket_text}</p>
+          </div>
+          <div className="flex items-center gap-2">
+            <AlertTriangle className="h-3.5 w-3.5 text-destructive" />
+            <span className="text-xs font-medium text-destructive">
+              {ticket.escalation_reason}
+            </span>
+          </div>
+        </div>
+
+        {/* Slack Notification Preview */}
+        <div className="md:w-64">
+          <div className="rounded-lg border border-l-4 border-l-[#4A154B] bg-[#f8f8f8] p-3 shadow-sm dark:bg-[#1a1d21]">
+            <div className="mb-2 flex items-center gap-1.5">
+              <MessageSquare className="h-3.5 w-3.5 text-[#4A154B]" />
+              <span className="text-[10px] font-bold uppercase tracking-wide text-[#4A154B]">
+                Slack Notification Preview
+              </span>
+            </div>
+            <div className="space-y-1.5 text-xs">
+              <p className="font-bold text-destructive">🚨 ESCALATED TICKET</p>
+              <div className="space-y-0.5 text-foreground">
+                <p>
+                  <span className="text-muted-foreground">Ticket ID:</span>{" "}
+                  {ticket.ticket_id}
+                </p>
+                <p>
+                  <span className="text-muted-foreground">Category:</span>{" "}
+                  {ticket.category}
+                </p>
+                <p>
+                  <span className="text-muted-foreground">Reason:</span>{" "}
+                  {ticket.escalation_reason}
+                </p>
+                <p>
+                  <span className="text-muted-foreground">Action Needed:</span>{" "}
+                  Human Review
+                </p>
+                <p>
+                  <span className="text-muted-foreground">Assigned To:</span>{" "}
+                  Support Team
+                </p>
+              </div>
+            </div>
+            <p className="mt-2 border-t pt-2 text-[10px] leading-snug text-muted-foreground">
+              This preview demonstrates the exact notification that would be sent to a
+              support Slack channel in production using Slack Incoming Webhooks.
+            </p>
+          </div>
+        </div>
+      </div>
+    </Card>
+  );
+}
+
+function SortableHead({
+  label,
+  sortKey,
+  current,
+  dir,
+  onClick,
+  className,
+}: {
+  label: string;
+  sortKey: SortKey;
+  current: SortKey;
+  dir: "asc" | "desc";
+  onClick: (k: SortKey) => void;
+  className?: string;
+}) {
+  const active = current === sortKey;
+  return (
+    <TableHead className={className}>
+      <button
+        type="button"
+        onClick={() => onClick(sortKey)}
+        className="inline-flex items-center gap-1 hover:text-foreground"
+      >
+        {label}
+        {active ? (
+          dir === "asc" ? (
+            <ArrowUp className="h-3 w-3" />
+          ) : (
+            <ArrowDown className="h-3 w-3" />
+          )
+        ) : (
+          <ArrowUpDown className="h-3 w-3 opacity-50" />
+        )}
+      </button>
+    </TableHead>
+  );
+}
+
+function ConfidenceMeter({ score }: { score: number }) {
+  const low = score < 80;
+  return (
+    <div className="space-y-1">
+      <div className="flex items-center justify-between gap-2">
+        <span
+          className={cn(
+            "text-xs font-semibold tabular-nums",
+            low ? "text-destructive" : "text-foreground",
+          )}
+        >
+          {score}%
+        </span>
+        {low && (
+          <Badge variant="outline" className="h-4 px-1 text-[10px]">
+            low
+          </Badge>
+        )}
+      </div>
+      <Progress
+        value={score}
+        className={cn("h-1.5", low && "[&>div]:bg-destructive")}
+      />
+    </div>
+  );
+}
+
+function EmptyState({ hasTickets }: { hasTickets: boolean }) {
+  return (
+    <div className="flex flex-col items-center justify-center px-6 py-16 text-center">
+      <div className="flex h-12 w-12 items-center justify-center rounded-full bg-muted text-muted-foreground">
+        <Inbox className="h-6 w-6" />
+      </div>
+      <h3 className="mt-4 text-sm font-semibold">
+        {hasTickets ? "Ready to triage" : "No tickets yet"}
+      </h3>
+      <p className="mt-1 max-w-sm text-xs text-muted-foreground">
+        {hasTickets
+          ? `${"You have tickets loaded. Click "}Run AI triage to classify them, suggest replies, and flag escalations.`
+          : "Upload a CSV of support tickets, or generate a synthetic batch to see the system in action."}
+      </p>
+    </div>
+  );
+}
+
+function LoadingState({ count }: { count: number }) {
+  const rows = Math.min(Math.max(count, 4), 8);
+  return (
+    <div className="space-y-3 p-6">
+      <div className="flex items-center gap-2 text-sm text-muted-foreground">
+        <Loader2 className="h-4 w-4 animate-spin" />
+        Analyzing tickets with Gemini 3 Flash…
+      </div>
+      <div className="space-y-2">
+        {Array.from({ length: rows }).map((_, i) => (
+          <div
+            key={i}
+            className="grid grid-cols-12 gap-3 rounded-md border bg-muted/20 p-3"
+          >
+            <div className="col-span-1 h-4 animate-pulse rounded bg-muted" />
+            <div className="col-span-5 h-4 animate-pulse rounded bg-muted" />
+            <div className="col-span-2 h-4 animate-pulse rounded bg-muted" />
+            <div className="col-span-3 h-4 animate-pulse rounded bg-muted" />
+            <div className="col-span-1 h-4 animate-pulse rounded bg-muted" />
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function StatCard({
+  icon,
+  label,
+  value,
+  tone = "default",
+  isActive,
+  onClick,
+}: {
+  icon: React.ReactNode;
+  label: string;
+  value: string;
+  tone?: "default" | "warn";
+  isActive?: boolean;
+  onClick?: () => void;
+}) {
+  const clickable = !!onClick;
+  return (
+    <Card
+      className={cn(
+        "p-3 transition-colors",
+        clickable && "cursor-pointer hover:bg-accent/40",
+        isActive && "ring-2 ring-primary bg-primary/5",
+      )}
+      onClick={onClick}
+    >
+      <div className="flex items-center gap-2 text-[11px] uppercase tracking-wide text-muted-foreground">
+        {icon}
+        <span>{label}</span>
+      </div>
+      <p
+        className={cn(
+          "mt-2 text-xl font-semibold tabular-nums",
+          tone === "warn" && !isActive && "text-destructive",
+        )}
+      >
+        {value}
+      </p>
+    </Card>
+  );
+}
+
+function CollapsibleWriteUp({ top2 }: { top2: string[] }) {
+  const [open, setOpen] = useState(false);
+  return (
+    <Collapsible open={open} onOpenChange={setOpen}>
+      <Card className="p-0">
+        <CollapsibleTrigger asChild>
+          <button
+            type="button"
+            className="flex w-full items-center justify-between px-4 py-3 text-left"
+          >
+            <div className="flex items-center gap-2">
+              <BookOpen className="h-4 w-4 text-muted-foreground" />
+              <span className="text-sm font-semibold">Project write-up</span>
+              <span className="text-xs text-muted-foreground">
+                Approach · Templates · Evaluation · Limitations · Production · Cost · Notes
+              </span>
+            </div>
+            <ChevronDown
+              className={cn(
+                "h-4 w-4 text-muted-foreground transition-transform",
+                open && "rotate-180",
+              )}
+            />
+          </button>
+        </CollapsibleTrigger>
+        <CollapsibleContent>
+          <div className="border-t p-4">
+            <WriteUp top2={top2} />
+          </div>
+        </CollapsibleContent>
+      </Card>
+    </Collapsible>
+  );
+}
+
+function WriteUp({ top2 }: { top2: string[] }) {
+  return (
+    <Tabs defaultValue="approach">
+      <TabsList className="flex-wrap">
+        <TabsTrigger value="approach">Approach</TabsTrigger>
+        <TabsTrigger value="templates">Top-2 templates</TabsTrigger>
+        <TabsTrigger value="eval">Evaluation</TabsTrigger>
+        <TabsTrigger value="limits">Limitations</TabsTrigger>
+        <TabsTrigger value="prod">Production at 10k/mo</TabsTrigger>
+        <TabsTrigger value="cost">Cost</TabsTrigger>
+        <TabsTrigger value="notes">Implementation notes</TabsTrigger>
+      </TabsList>
+
+      <TabsContent value="approach">
+        <Card className="space-y-4 p-6 text-sm leading-relaxed">
+          <Section title="Workflow">
+            <pre className="mt-1 overflow-x-auto rounded-md border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">
+{`Customer Ticket
+   ↓
+AI Classification  (category + confidence)
+   ↓
+Suggested Reply   (templated, empathetic)
+   ↓
+Escalation Check  (risk rules + confidence threshold)
+   ↓
+Human Review Queue  (only if escalated)
+   ↓
+Slack Notification  (incoming webhook)
+   ↓
+Support Agent`}
+            </pre>
+          </Section>
+          <Section title="Architecture">
+            Single-page TanStack Start app. The browser sends a batch of tickets to a
+            server function which calls the Lovable AI Gateway (Gemini 3 Flash) using the AI
+            SDK's structured-output mode. The model returns a typed array of
+            classifications, suggested replies, and escalation flags in one round-trip.
+          </Section>
+          <Section title="Taxonomy rationale">
+            Five categories were chosen to map directly to the support team's existing
+            workflows: <b>Billing &amp; Payments</b>, <b>Account Issues</b>,{" "}
+            <b>Content Access Problems</b>, <b>Technical Bugs</b>, and{" "}
+            <b>General Feedback</b>. They are mutually exclusive at the routing level,
+            collectively cover the long tail of a subscription consumer app, and each maps
+            to a distinct ownership team (finance, identity, content ops, engineering,
+            product).
+          </Section>
+          <Section title="Model choice">
+            <b>google/gemini-3-flash-preview</b> via Lovable AI Gateway. It is fast,
+            inexpensive, multilingual, and strong at short-form classification + generation
+            in one shot. Structured output (Zod schema) removes JSON-parsing failure modes.
+          </Section>
+          <Section title="Prompting strategy">
+            A single system prompt defines the taxonomy with crisp inclusion criteria, the
+            escalation rules, and the output contract. Tickets are sent as a JSON array and
+            classified in one batched call. Each output entry includes a confidence score,
+            which gives reviewers visibility into the model's certainty without inflating
+            token cost.
+          </Section>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="templates">
+        <Card className="space-y-4 p-6 text-sm leading-relaxed">
+          <p className="text-muted-foreground">
+            {top2.length > 0
+              ? `Templates for your current top 2 categories: ${top2.join(" and ")}.`
+              : "Run triage to surface your top 2 categories. Generic templates below."}
+          </p>
+          {(top2.length > 0 ? top2 : ["Billing & Payments", "Technical Bugs"]).map((c) => (
+            <div key={c} className="rounded-md border bg-muted/30 p-4">
+              <p className="font-semibold">{c}</p>
+              <pre className="mt-2 whitespace-pre-wrap font-sans text-sm">
+                {TEMPLATES[c] ?? "Hi {{name}}, thanks for reaching out about {{topic}}…"}
+              </pre>
+            </div>
+          ))}
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="eval">
+        <Card className="space-y-4 p-6 text-sm leading-relaxed">
+          <Section title="Worked example — 20-ticket gold set">
+            <div className="mt-2 grid gap-3 sm:grid-cols-3">
+              <div className="rounded-md border bg-muted/30 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Total evaluation tickets
+                </p>
+                <p className="mt-1 text-2xl font-semibold text-foreground">20</p>
+              </div>
+              <div className="rounded-md border bg-muted/30 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Correct classifications
+                </p>
+                <p className="mt-1 text-2xl font-semibold text-foreground">18</p>
+              </div>
+              <div className="rounded-md border bg-muted/30 p-3">
+                <p className="text-[10px] uppercase tracking-wide text-muted-foreground">
+                  Classification accuracy
+                </p>
+                <p className="mt-1 text-2xl font-semibold text-foreground">90%</p>
+              </div>
+            </div>
+            <p className="mt-3 rounded-md border border-amber-500/30 bg-amber-500/5 p-3 text-xs text-foreground">
+              <b>Note:</b> Model confidence scores should not be interpreted as true
+              accuracy. Confidence reflects model certainty, while accuracy must be measured
+              against manually labeled ground-truth data.
+            </p>
+          </Section>
+          <Section title="Accuracy">
+            Build a labelled gold set of ~300 historical tickets (60 per category, stratified
+            by language and length). Measure top-1 accuracy nightly against a fresh
+            model-versioned snapshot; alert if it drops &gt;2pp week-over-week.
+          </Section>
+          <Section title="Precision by category">
+            Track per-category precision/recall/F1 in a confusion matrix. The cost of a
+            misclassification is asymmetric — routing a security ticket to "Feedback" is far
+            worse than the reverse — so set per-category thresholds and weight Account
+            Issues and Billing precision the highest.
+          </Section>
+          <Section title="Escalation recall — why it matters most">
+            Of tickets a human reviewer marked as "should escalate", what fraction did we
+            flag? Target ≥95% recall, even at the cost of some false-positive escalations.
+            <p className="mt-2 rounded-md border border-destructive/30 bg-destructive/5 p-3 text-xs text-foreground">
+              <b>Why this metric is critical:</b> Missing a high-risk ticket (fraud, hacked
+              account, legal threat) is more costly than over-escalating a normal ticket.
+            </p>
+          </Section>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="limits">
+        <Card className="space-y-3 p-6 text-sm leading-relaxed">
+          <Section title="Known limitations">
+            <ul className="mt-2 list-disc space-y-2 pl-6">
+              <li>
+                The evaluation dataset is synthetic and cleaner than real-world support
+                tickets.
+              </li>
+              <li>
+                Real tickets may contain spelling mistakes, multiple issues, incomplete
+                context, and multiple languages.
+              </li>
+              <li>
+                The current implementation uses single-label classification and may miss
+                secondary issues contained within the same ticket.
+              </li>
+              <li>
+                The current implementation relies on a single LLM provider. In production,
+                the model layer should support switching between Gemini, OpenAI, Claude, or
+                open-source models.
+              </li>
+            </ul>
+          </Section>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="prod">
+        <Card className="space-y-4 p-6 text-sm leading-relaxed">
+          <Section title="Batch processing">
+            Classify 10–25 tickets per LLM call to amortize the system-prompt cost and keep
+            p95 latency under ~3s per batch. Batches sized dynamically based on queue depth.
+          </Section>
+          <Section title="Asynchronous queue-based processing">
+            Tickets land on a durable queue (SQS, Postgres + cron, or Cloudflare Queues).
+            Workers pull batches, call the gateway, and write results back. The UI is
+            read-only — no blocking on the LLM in the user path.
+          </Section>
+          <Section title="Human review workflow">
+            Anything escalated or with confidence &lt; 80% goes to a review queue with the
+            suggested reply pre-filled. Reviewer edits are logged and fed back as eval data.
+          </Section>
+          <Section title="Slack notifications">
+            Escalated tickets fire a Slack Incoming Webhook to the on-call support channel
+            with ticket ID, category, reason, and a deep link to the review queue.
+          </Section>
+          <Section title="Monitoring and logging">
+            Track per-batch latency, token usage, error rates, schema-violation rates, and
+            escalation volume. Log every prompt/response pair (PII-scrubbed) for replay and
+            regression testing. Dashboards in Grafana / Datadog with alerts on accuracy
+            drift.
+          </Section>
+          <Section title="Caching frequently occurring patterns">
+            Hash <code>ticket_text</code> (and a normalized form) and cache the
+            classification for 30 days. Duplicate or near-duplicate tickets (common during
+            outages) skip the model entirely — typically 15–25% cache hit rate.
+          </Section>
+          <Section title="Model fallback strategy">
+            Primary: Gemini 3 Flash. On rate-limit or 5xx, fall back to a secondary provider
+            (e.g. GPT-4o-mini or Claude Haiku) behind the same Zod schema. Circuit breaker
+            trips after N consecutive failures and routes to a rules-based classifier so
+            triage never fully stops.
+          </Section>
+          <Section title="Human feedback loop">
+            Every reviewer override (category change, edited reply, escalation correction)
+            is captured as a labeled example. Weekly job builds a fresh few-shot set and an
+            offline eval; quarterly review decides on prompt updates or fine-tuning.
+          </Section>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="cost">
+        <Card className="space-y-4 p-6 text-sm leading-relaxed">
+          <Section title="Assumptions">
+            <ul className="mt-2 list-disc space-y-1 pl-6">
+              <li>10,000 tickets / month</li>
+              <li>~800 tokens per ticket end-to-end (input + output, including system prompt amortized over batches of 20)</li>
+              <li>Roughly 300 input tokens + 500 output tokens per ticket</li>
+              <li>Gemini 3 Flash class pricing: ~$0.30 / M input, ~$2.50 / M output</li>
+            </ul>
+          </Section>
+          <Section title="Estimated monthly LLM cost">
+            <ul className="mt-2 list-disc space-y-1 pl-6">
+              <li>Input: 10,000 × 300 = 3M tokens → ~$0.90</li>
+              <li>Output: 10,000 × 500 = 5M tokens → ~$12.50</li>
+              <li>
+                <b>Total ≈ $13–15 / month</b> for raw LLM spend.
+              </li>
+              <li>
+                With a 3× safety margin for retries, longer tickets, and eval traffic,
+                budget <b>~$45 / month</b>.
+              </li>
+            </ul>
+          </Section>
+          <Section title="Hosting and monitoring">
+            Worker / queue hosting on Cloudflare Workers or a small ECS service: ~$20–50 /
+            month at this scale. Monitoring (Datadog / Grafana Cloud free tiers or
+            ~$30/mo). Total infra envelope: <b>~$100 / month all-in.</b>
+          </Section>
+          <Section title="Comparison vs. fully manual triage">
+            Manual first-pass triage of 10,000 tickets at ~2 min/ticket = ~330 agent hours
+            per month. At a fully-loaded cost of $30/hour, that is{" "}
+            <b>~$10,000 / month</b> in agent time, vs. ~$100 with AI triage plus reviewer
+            time only on the ~5–15% that escalate. Net savings: roughly{" "}
+            <b>2 orders of magnitude</b>, while also reducing first-response latency from
+            hours to seconds.
+          </Section>
+        </Card>
+      </TabsContent>
+
+      <TabsContent value="notes">
+        <Card className="space-y-3 p-6 text-sm leading-relaxed">
+          <Section title="Implementation notes">
+            This solution was built using Lovable for rapid prototyping. The taxonomy
+            design, escalation logic, evaluation methodology, production considerations,
+            and cost estimation were designed manually.
+          </Section>
+        </Card>
+      </TabsContent>
+    </Tabs>
+  );
+}
+
+function Section({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div>
+      <h3 className="text-sm font-semibold">{title}</h3>
+      <div className="mt-1 text-sm text-muted-foreground">{children}</div>
+    </div>
+  );
+}
+
+const TEMPLATES: Record<string, string> = {
+  "Billing & Payments": `Hi {{name}},
+
+Thanks for reaching out about your PocketToons subscription. I've pulled up your account and can see the {{charge_type}} on {{date}}. Here's what I can do: {{action}}. You'll see this reflected within 3–5 business days. If anything still looks off, just reply here and I'll dig in further.
+
+— PocketToons Support`,
+  "Account Issues": `Hi {{name}},
+
+Sorry for the trouble accessing your account. I've {{action_taken}} and sent a secure reset link to {{email}}. For your safety, please don't share the link with anyone. Let me know once you're back in and I'll make sure everything's in order.
+
+— PocketToons Support`,
+  "Content Access Problems": `Hi {{name}},
+
+Thanks for letting us know — that episode should absolutely be playing for you. I've checked {{issue}} and {{resolution}}. Could you try closing and reopening the app? If it still won't load, send us a screenshot and your device model and we'll get it sorted right away.
+
+— PocketToons Support`,
+  "Technical Bugs": `Hi {{name}},
+
+Really sorry for the hiccup. I've logged this with our engineering team along with your device details. A quick fix that usually helps: {{quick_fix}}. We'll follow up here as soon as a fix ships — usually within the next app update.
+
+— PocketToons Support`,
+  "General Feedback": `Hi {{name}},
+
+Thanks so much for taking the time to share this — it genuinely helps us make PocketToons better. I've passed your note along to the product team. Keep the ideas coming!
+
+— PocketToons Support`,
+};
